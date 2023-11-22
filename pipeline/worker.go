@@ -78,53 +78,56 @@ Define a group of workers.
 Read the input channel calling consumer for each element.
 The group will end when the input is closed or the consumer returns an error.
 
-If WithProgress is true each worker will output each element processed and the output channel needs to be received from.
-Otherwise the output channel will be closed.
+If WithProgress is true each worker will output each element processed (the output channel needs to be received from).
+Effectively a passthru.
 */
-func group[T any](pipeline pipeline, input chan T, c func(T) error, opts groupOptions) chan groupProgress[T] {
-	groupUUID := uuid.New()
+func WorkerGroup[T any](pipeline Pipeline, input Source[T], c func(Pipeline, T) error, opts groupOptions) *source[groupProgress[T]] {
+	// groupUUID := uuid.New()
 
-	logger := Logger().With("group", groupUUID)
+	// logger := Logger().With("group", groupUUID)
 
-	logger.Debug("Start", "Options", opts)
+	// logger.Debug("Start", "Options", opts)
 
 	workersCount := atomic.Int64{}
 	workersRunning := atomic.Int64{}
-	workerInput := make(chan T)
+
+	sliceInput := make(chan T)
+	sliceInputCount := 0
+
 	workerWaitGroup := sync.WaitGroup{}
 
-	output := make(chan groupProgress[T])
+	workerGroup := NewSource[groupProgress[T]](pipeline, "WorkerGroup")
 
-	worker := func() {
-		workerUUID := uuid.New()
+	slice := func() {
+		sliceUUID := uuid.New()
 
-		logger := logger.With("worker", workerUUID)
+		sliceInputCount := 0
+
+		logger := workerGroup.Logger().With("Slice", sliceUUID)
 
 		logger.Debug("Start")
 
 		defer func() {
 			workersRunning.Add(-1)
 			workerWaitGroup.Done()
-			logger.Debug("End", "WorkersCount", workersCount.Load())
+			logger.Debug("Metrics", "SliceInputCount", sliceInputCount)
 		}()
 
-		workersCount.Add(1)
-		workersRunning.Add(1)
-		workerWaitGroup.Add(1)
 		idleTimer := time.NewTimer(opts.IdleWorkerDuration)
 		for {
 			select {
-			case t, ok := <-workerInput:
+			case t, ok := <-sliceInput:
+				sliceInputCount++
 				logger.Debug("Received from input", "t", t, "ok", ok)
 				if !ok {
 					return
 				}
-				if err := c(t); err != nil {
+				if err := c(pipeline, t); err != nil {
 					return
 				}
 				if opts.Progress {
 					select {
-					case output <- groupProgress[T]{groupUUID, workerUUID, t}:
+					case workerGroup.Output() <- groupProgress[T]{workerGroup.ID(), sliceUUID, t}:
 					case <-pipeline.Done():
 						return
 					}
@@ -145,35 +148,42 @@ func group[T any](pipeline pipeline, input chan T, c func(T) error, opts groupOp
 
 	go func() {
 		defer func() {
-			logger.Debug("Close worker input")
-			close(workerInput)
-			logger.Debug("Wait for workers to finish", "workerCount", workersRunning.Load())
+			close(sliceInput)
+
 			workerWaitGroup.Wait()
-			logger.Debug("Close output")
-			close(output)
-			logger.Debug("OK")
+
+			close(workerGroup.Output())
+			workerGroup.Metrics("SliceCount", workersCount.Load(), "SliceInputCount", sliceInputCount)
+			pipeline.FlowDone(workerGroup)
 		}()
 
 		for {
 			select {
-			case t, ok := <-input:
+			case t, ok := <-input.Output():
 				if !ok {
-					logger.Debug("Input closed")
+					workerGroup.Logger().Debug("Input closed")
 					return
 				}
+
 				select {
-				case workerInput <- t:
+				case sliceInput <- t:
+					sliceInputCount++
 				case <-pipeline.Done():
+					workerGroup.Logger().Debug("Pipeline done")
 					return
 				default:
-					logger.Debug("No worker available")
+					workerGroup.Logger().Debug("No slice available")
 					if int(workersRunning.Load()) < opts.MaxWorkers {
-						logger.Debug("New worker")
-						go worker()
+						logger.Debug("New slice")
+						workersCount.Add(1)
+						workersRunning.Add(1)
+						workerWaitGroup.Add(1)
+						go slice()
 					}
-					logger.Debug("Waiting on worker")
+					logger.Debug("Waiting on slice")
 					select {
-					case workerInput <- t:
+					case sliceInput <- t:
+						sliceInputCount++
 					case <-pipeline.Done():
 						return
 					}
@@ -184,9 +194,5 @@ func group[T any](pipeline pipeline, input chan T, c func(T) error, opts groupOp
 		}
 	}()
 
-	return output
-}
-
-func Group[T any](pipeline pipeline, input chan T, f func(T) error, opts groupOptions) chan groupProgress[T] {
-	return group[T](pipeline, input, f, opts)
+	return workerGroup
 }
