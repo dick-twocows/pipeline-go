@@ -1,34 +1,26 @@
 package pipeline
 
 import (
-	"fmt"
-	"sync"
 	"testing"
 )
 
+func TestEmpty(t *testing.T) {
+	pipeline := NewPipeline()
+	defer pipeline.Cancel()
+
+	slice := EmptySlice[int](pipeline)
+	<-ForEachStdOutV[int](pipeline, slice).Output()
+
+	StdOutConsumer[int](pipeline, int(slice.Count.Load()))
+}
+
 func TestSlicer(t *testing.T) {
-	pipeline := Background()
+	pipeline := NewPipeline()
+	defer pipeline.Cancel()
 
-	output := Slice[int](pipeline, []int{0, 1, 2, 3, 4, 5})
+	slice := Slice[int](pipeline, []int{0, 1, 2, 3, 4})
 
-	wg := sync.WaitGroup{}
+	<-ForEachStdOutV[int](pipeline, slice).Output()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		for {
-			select {
-			case t, ok := <-output:
-				if !ok {
-					return
-				}
-				fmt.Printf("%v\n", t)
-			case <-pipeline.Done():
-				return
-			}
-		}
-	}()
-
-	wg.Wait()
+	StdOutConsumer[int](pipeline, int(slice.Count.Load()))
 }

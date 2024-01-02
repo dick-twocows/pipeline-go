@@ -1,19 +1,38 @@
 package pipeline
 
-func Slice[T any](p pipeline, input []T) chan T {
-	output := make(chan T)
+import (
+	"sync/atomic"
+)
+
+type slice[T any] struct {
+	source[T]
+	Count atomic.Int64
+}
+
+func Slice[T any](p Pipeline, i []T) *slice[T] {
+
+	source := &slice[T]{*NewSource[T](p, "Slice"), atomic.Int64{}}
 
 	go func() {
-		defer close(output)
+		defer func() {
+			close(source.Output())
+			p.FlowDone(source)
+		}()
 
-		for _, t := range input {
+		for _, t := range i {
 			select {
-			case output <- t:
-			case <-p.ctx.Done():
+			case source.Output() <- t:
+				source.Count.Add(1)
+			case <-p.CTX().Done():
 				return
 			}
 		}
 	}()
 
-	return output
+	return source
+}
+
+// Convenience function to return an empty []T.
+func EmptySlice[T any](p Pipeline) *slice[T] {
+	return Slice[T](p, []T{})
 }
