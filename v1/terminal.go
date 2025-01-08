@@ -1,19 +1,18 @@
-package terminal
+package v1
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 
 	"github.com/google/uuid"
-
-	"github/dick-twocows/pipeline-go/control"
 )
 
 // Apply a terminal action to the given Source, e.g. count.
 type Terminal[T, R any] interface {
-	control.Control
+	Control
+	Logger() *slog.Logger
+	Pipeline() Pipeline
 	Source() Source[T]
 	Result() chan optional[R]
 }
@@ -25,12 +24,12 @@ func NilTerminalFinally() error {
 }
 
 type terminal[T, R any] struct {
-	// Stream this terminal belongs to.
-	stream Stream
 	//
-	control
+	*control
 	// slog
 	logger *slog.Logger
+	// Pipeline this terminal belongs to.
+	pipeline Pipeline
 	// Source this terminal will consume.
 	source Source[T]
 	// The func called when the source has been consumed.
@@ -47,39 +46,53 @@ func (terminal *terminal[T, R]) Stop() error {
 		close(terminal.result)
 	})
 
+	terminal.Stop()
+
 	return nil
+}
+
+func (terminal *terminal[T, R]) Logger() *slog.Logger {
+	return terminal.logger
+}
+
+func (terminal *terminal[T, R]) Pipeline() Pipeline {
+	return terminal.pipeline
 }
 
 func (terminal *terminal[T, R]) Source() Source[T] {
 	return terminal.source
 }
 
-func (terminal *terminal[T, R]) Result() chan optional[R] {
+func (terminal *terminal[T, R]) Result() <-chan optional[R] {
 	return terminal.result
 }
 
-func (terminal *terminal[T, R]) SendResult(result optional[R]) error {
+func (terminal *terminal[T, R]) sendResult(r optional[R]) error {
 	select {
-	case terminal.result <- result:
-		fmt.Printf("terminal send result [%v]\n", result)
+	case terminal.result <- r:
+		terminal.logger.Debug("sent result", slog.Any("r", r))
+		return nil
 	case <-terminal.control.Control():
-		return errors.New("Terminal control closed")
-	case <-terminal.stream.Control():
-		return errors.New("Terminal stream control closed")
+		return errors.New("terminal control closed")
+	case <-terminal.pipeline.Control():
+		return errors.New("terminal pipeline control closed")
 	}
-	return nil
 }
 
-func newTerminal[T, R any](stream Stream, source Source[T], finally TerminalFinally) *terminal[T, R] {
-	return &terminal[T, R]{
-		stream,
-		newControl(),
-		stream.Logger().With(
-			slog.Group(
-				"Terminal",
-				slog.String("UUID", uuid.New().String()),
-			),
+func newTerminal[T, R any](pipeline Pipeline, source Source[T], finally TerminalFinally) *terminal[T, R] {
+	control := NewControl()
+
+	logger := control.Logger().With(
+		slog.Group(
+			"Terminal",
+			slog.String("UUID", uuid.New().String()),
 		),
+	)
+
+	return &terminal[T, R]{
+		control,
+		logger,
+		pipeline,
 		source,
 		finally,
 		make(chan optional[R]),

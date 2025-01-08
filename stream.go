@@ -17,8 +17,8 @@ var logger slog.Logger
 
 func init() {
 	handlerOptions := &slog.HandlerOptions{
-		AddSource: true,
-		Level:     slog.LevelDebug,
+		// AddSource: true,
+		Level: slog.LevelDebug,
 	}
 
 	logger = *slog.New(slog.NewTextHandler(os.Stdout, handlerOptions))
@@ -215,15 +215,194 @@ func NewSlice[T any](stream Stream, in []T) *slice[T] {
 // Intermediate
 
 type Intermediate[T, R any] interface {
-	Control
-	Source() Source[T]
-	Out() chan R
+	Source[R]
+}
+
+type intermediate[T, R any] struct {
+	source[R]
+	logger *slog.Logger
+}
+
+func NewIntermediate[T, R any](stream Stream) *intermediate[T, R] {
+	return &intermediate[T, R]{
+		newSource[R](stream),
+		slog.With(
+			slog.Group(
+				"Intermediate",
+				slog.String("UUID", uuid.New().String()),
+			),
+		),
+	}
+}
+
+type mapIntermediate[T, R any] struct {
+	intermediate[T, R]
+	source Source[T]
+	mapper func(T) (R, error)
+}
+
+func (i *mapIntermediate[T, R]) Start() error {
+	go func() {
+		logger := i.logger.With(
+			slog.Group(
+				"Map",
+			),
+		)
+
+		count := 0
+
+		defer func() {
+			logger.Debug("deferred intermediate stop", slog.Int("Count", count))
+			i.Stop()
+		}()
+
+		for {
+			select {
+			case t, ok := <-i.source.Out():
+				logger.Debug("received", slog.Any("t", t), slog.Bool("ok", ok))
+				if !ok {
+					logger.Debug("returning as source closed")
+					return
+				}
+
+				r, err := i.mapper(t)
+				if err != nil {
+					logger.Error("returning as error mapping T to R", slog.Any("Error", err), slog.Any("t", t))
+					return
+				}
+
+				select {
+				case i.Out() <- r:
+					logger.Debug("sent r")
+					count++
+				case <-i.Control():
+					logger.Debug("returning as intermediate control closed")
+					return
+				case <-i.Stream().Control():
+					logger.Debug("returning as intermediate stream control closed")
+					return
+				}
+			case <-i.Control():
+				logger.Debug("returning as intermediate control closed")
+				return
+			case <-i.Stream().Control():
+				logger.Debug("returning as intermediate stream control closed")
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+func NewMapIntermediate[T, R any](stream Stream, source Source[T], mapper func(T) (R, error)) *mapIntermediate[T, R] {
+	return &mapIntermediate[T, R]{
+		*NewIntermediate[T, R](stream),
+		source,
+		mapper,
+	}
+}
+
+func NewMapToString[T any](stream Stream, source Source[T]) *mapIntermediate[T, string] {
+	mapper := func(t T) (string, error) {
+		return fmt.Sprintf("%v", t), nil
+	}
+
+	return NewMapIntermediate(
+		stream,
+		source,
+		mapper,
+	)
+}
+
+// Peek the given source T with the given consumer function.
+type peekIntermediate[T any] struct {
+	intermediate[T, T]
+	source   Source[T]
+	consumer func(T) error
+}
+
+func (i *peekIntermediate[T]) Start() error {
+	go func() {
+		logger := i.logger.With(
+			slog.Group(
+				"Peek",
+				slog.String("UUID", uuid.NewString()),
+			),
+		)
+
+		count := 0
+
+		defer func() {
+			logger.Debug("deferred intermediate stop", slog.Int("Count", count))
+			i.Stop()
+		}()
+
+		for {
+			select {
+			case t, ok := <-i.source.Out():
+				logger.Debug("received", slog.Any("t", t), slog.Bool("ok", ok))
+				if !ok {
+					logger.Debug("returning as source closed")
+					return
+				}
+
+				if err := i.consumer(t); err != nil {
+					logger.Error("returning as error consuming T", slog.Any("Error", err), slog.Any("t", t))
+					return
+				}
+
+				select {
+				case i.Out() <- t:
+					logger.Debug("sent r")
+					count++
+				case <-i.Control():
+					logger.Debug("returning as intermediate control closed")
+					return
+				case <-i.Stream().Control():
+					logger.Debug("returning as intermediate stream control closed")
+					return
+				}
+			case <-i.Control():
+				logger.Debug("returning as intermediate control closed")
+				return
+			case <-i.Stream().Control():
+				logger.Debug("returning as intermediate stream control closed")
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+func NewPeek[T any](stream Stream, source Source[T], consumer func(T) error) *peekIntermediate[T] {
+	return &peekIntermediate[T]{
+		*NewIntermediate[T, T](
+			stream,
+		),
+		source,
+		consumer,
+	}
+}
+
+func NewPeekToStdOut[T any](stream Stream, source Source[T]) *peekIntermediate[T] {
+	return NewPeek(
+		stream,
+		source,
+		func(t T) error {
+			fmt.Printf("%v\n", t)
+			return nil
+		},
+	)
 }
 
 // Terminal
 // Apply a terminal action to the given Source, e.g. count.
 type Terminal[T, R any] interface {
 	Control
+	Stream() Stream
+	Logger() *slog.Logger
 	Source() Source[T]
 	Result() chan optional[R]
 }
@@ -258,6 +437,14 @@ func (terminal *terminal[T, R]) Stop() error {
 	})
 
 	return nil
+}
+
+func (terminal *terminal[T, R]) Stream() Stream {
+	return terminal.stream
+}
+
+func (terminal *terminal[T, R]) Logger() *slog.Logger {
+	return terminal.logger
 }
 
 func (terminal *terminal[T, R]) Source() Source[T] {
@@ -299,22 +486,35 @@ func newTerminal[T, R any](stream Stream, source Source[T], finally TerminalFina
 
 // Block until the given terminal yields a result.
 // We do not check the source control because it will be closed.
-func WaitForTerminalResult[T, R any](terminal Terminal[T, R]) []optional[R] {
+func WaitForTerminal[T, R any](terminal Terminal[T, R]) []optional[R] {
+	logger := terminal.Logger().With(
+		slog.Group(
+			"WaitForTerminalResult",
+			slog.String("UUID", uuid.NewString()),
+		),
+	)
+
+	logger.Debug("waiting")
+
 	result := []optional[R]{}
+
 	for {
 		select {
 		case t, ok := <-terminal.Result():
 			if !ok {
+				logger.Debug("result channel closed", slog.Int("ResultsCount", len(result)))
 				return result
 			}
+			logger.Debug("appending result")
 			result = append(result, t)
 		case <-terminal.Control():
+			logger.Debug("terminal control closed, returning")
 			return result
 		case <-terminal.Source().Stream().Control():
+			logger.Debug("terminal source stream control closed, returning")
 			return result
 		}
 	}
-
 }
 
 // Terminals

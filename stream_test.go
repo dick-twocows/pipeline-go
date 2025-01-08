@@ -18,7 +18,7 @@ func TestForEach(t *testing.T) {
 
 	forEach := NewIgnoreResultTerminal[int](stream, slice, consumer, NilTerminalFinally)
 	forEach.Start()
-	WaitForTerminalResult[int, struct{}](forEach)
+	WaitForTerminal[int, struct{}](forEach)
 }
 
 func TestConsumeToStdOut(t *testing.T) {
@@ -29,7 +29,7 @@ func TestConsumeToStdOut(t *testing.T) {
 
 	forEach := NewConsumeToStdOut[int](stream, slice)
 	forEach.Start()
-	WaitForTerminalResult[int, struct{}](forEach)
+	WaitForTerminal[int, struct{}](forEach)
 }
 
 func TestCount(t *testing.T) {
@@ -40,7 +40,7 @@ func TestCount(t *testing.T) {
 
 	count := NewCount[int](stream, slice)
 	count.Start()
-	fmt.Printf("count result %v\n", WaitForTerminalResult[int, int](count))
+	fmt.Printf("count result %v\n", WaitForTerminal[int, int](count))
 }
 
 func TestMin(t *testing.T) {
@@ -51,7 +51,7 @@ func TestMin(t *testing.T) {
 
 	terminal := NewMin[int](stream, slice)
 	terminal.Start()
-	fmt.Printf("min result %v\n", WaitForTerminalResult[int, int](terminal))
+	fmt.Printf("min result %v\n", WaitForTerminal[int, int](terminal))
 }
 
 func TestMax(t *testing.T) {
@@ -62,5 +62,22 @@ func TestMax(t *testing.T) {
 
 	terminal := NewMax[int](stream, slice)
 	terminal.Start()
-	fmt.Printf("max result %v\n", WaitForTerminalResult[int, int](terminal))
+	fmt.Printf("max result %v\n", WaitForTerminal[int, int](terminal))
+}
+
+func TestMapToString(t *testing.T) {
+	stream := NewStream()
+
+	slice := NewSlice(stream, []int{1, 2, 3, 4, 5})
+	slice.Start()
+
+	m := NewMapToString[int](stream, slice)
+	m.Start()
+
+	p := NewPeekToStdOut[string](stream, m)
+	p.Start()
+
+	terminal := NewConsumeToStdOut[string](stream, p)
+	terminal.Start()
+	fmt.Printf("result %v\n", WaitForTerminal[string, struct{}](terminal))
 }
